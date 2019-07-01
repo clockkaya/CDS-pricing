@@ -1,0 +1,694 @@
+
+# coding: utf-8
+
+# # FE8709 Credit Risk: Measurement & Management, AY 2018-19, NTU MFE
+# ### Hu Xiaohang, Qiu Mingyu, Wu Siying, Zhang Jiahui
+# The report is divided into four parts, namely 1) data preparation, 2) survival curve calibration, 3) CDS pricing with calibrated survival curve and 4) summary of results. Detailed methodology will be presented alongside the Python code grouped into different chunks in a logical and reader-friendly way.
+
+# ## 1 Loading and preparing data
+
+# In[1]:
+
+
+import pandas as pd
+import scipy as sp
+import numpy as np
+import datetime as dt
+import string
+import math
+import matplotlib
+import matplotlib.pyplot as plt
+
+
+# ### 1.1 CDSs on the market
+# This section involves data input and a series of processing and restructuring of data.
+
+# In[2]:
+
+
+# trade date of standard CDS
+trade_date = np.datetime64('2014-02-28')
+
+# time to maturity of standard CDS in years
+TTM = np.array([0.5, 1, 2, 3, 4, 5, 7, 10, 20, 30])
+
+# maturity dates for 10 standard CDS (before modified following adjustment)
+maturity_dates = np.array(['2014-09-20', '2015-03-20', '2016-03-20', '2017-03-20', '2018-03-20',
+                  '2019-03-20', '2021-03-20', '2024-03-20', '2034-03-20', '2044-03-20'], dtype=np.datetime64)
+
+# spreads of the 10 CDS, (originally quoted in basis points,) converted to decimals
+spread = np.array([103.07, 104.68, 106.74, 110.31, 113.38, 116.98, 128.78, 143.51, 159.43, 164.13]) / 10000
+
+# expected recovery rate, assume the same for the 10 std CDS
+recovery = 0.45
+
+# standard maturity dates for 10 standard CDS (before modified following adjustment)
+# use [pd.date_range] to generate month ends for Feb, May, Aug and Nov for 4*30+1 periods and then offset these month ends by 20 days to get the 20th day of the subsequent months
+# note that these are also the premium payment dates
+std_maturity_raw = pd.date_range(start=trade_date, periods=TTM[-1]*4+1, freq='3M') + 20 * pd.offsets.DateOffset()
+
+
+# In[3]:
+
+
+# function to adjust the raw date according to modified following convention
+def modified_following(d):
+    """
+    :param d: a date
+    :return: date after modified following adjustment (if applicable)
+    """
+    if(d.weekday() > 4): # d.weekday returns the day of the week, where 5 and 6 indicates weekends
+        d = d + pd.offsets.BDay()
+        
+    return d
+
+
+# In[4]:
+
+
+# actual standard maturity dates (after modified following adjustments)
+std_maturity = [modified_following(x) for x in std_maturity_raw]
+
+# full list merging the trade date with standard maturity dates
+dates = [trade_date] + std_maturity
+
+# intervals (in years) between two consecutive dates
+# the idea is to convert intervals in days to fraction of years following actual/360 day-count convention
+interval = np.diff(dates)
+interval = [x.days/360 for x in interval]
+
+# time from trade date (t_0 for the standard CDS) to future payment dates starting from t_1
+time_to_pmt = np.cumsum(interval)
+
+# index to look up for the adjusted actual "time to maturity" in the [time_to_pmt] list
+# note that the actual time to maturity is different from those stored in [TTM] as the contract will mature on the first standard maturity date T years after the trade date
+N = [int(i) for i in TTM * 4]
+
+# insert 0 in front of the actual time to maturities, for ease of calculation later
+maturity = np.insert(time_to_pmt[N], 0, 0)
+
+# intervals between two consecutive maturities: T_i - T_(i-1), where i = 1...10
+maturity_diff = np.diff(maturity, 1)
+
+# insert 0 in front as the first element in time_to_pmt to include t_0
+# assume current time is t_0
+time_to_pmt = np.insert(time_to_pmt, 0, 0)
+
+
+# ### 1.2 Term structure of interest rates and discount factor 
+# The first step is to apply Nelson-Siegel model to generate interest rates r(0,s) and then calculate the corresponding discount factors for the ten CDSs. 
+
+# In[5]:
+
+
+# 4 parameters of Nelson-Siegel model: beta0, beta1, beta2 and tau
+param = [0.0408, -0.0396, -0.0511, 1.614]
+
+
+# In[6]:
+
+
+# fuction to generate spot rate
+def Nelson_Siegel(param, s):
+    """
+    :param param: list of parameters in the Nelson Siegel model
+    :param s: maturity in years, with actual/360 day-count convention
+    :return: spot rate from Nelson Siegel model
+    """
+    beta0 = param[0]
+    beta1 = param[1]
+    beta2 = param[2]
+    tau = param[3]
+    # when s = 0, Nelson Siegel model computes the instantaneous spot rate by beta0 + beta1
+    if (s == 0):
+        r = beta0 + beta1
+    else:
+        r = beta0 + beta1 * tau/s * (1-np.exp(-s/tau)) + beta2 * (tau/s * (1-np.exp(-s/tau)) - np.exp(-s/tau))
+        
+    return r
+
+# fuction to compute discount factor using calculated interest rates
+def discount_factor(param, t):
+    """
+    :param param: parameters of Nelson-Siegel model
+    :param t: maturity in years, with actual/360 day-count convention
+    :return: the discount factor with continuously compounding
+    """
+    r = Nelson_Siegel(param, t)
+    return np.exp(-r * t)
+
+
+# In[7]:
+
+
+# the discount factor for each future payment date excluding t_0
+Z = np.asarray([discount_factor(param, x) for x in time_to_pmt[1:]])
+
+# multiply each interval length by corresponding discount factor
+# note that we separate this calculation because it would be reused in later calculations
+interval_mult_Z = np.multiply(interval, Z)
+
+
+# ## 2 Calibration of surivial probability curve
+# In the following sections we will first show how to use reduced-form model to value both the protection and protection legs, and hence the breakeven spread of a default swap. We can then use this model to imply the term structure of arbitrage-free survival probabilities from market spreads.
+
+# ### 2.1 Piecewise function of survival probability Q(0,t)
+# The standard modeling assumption used in the CDS market is to assume that the hazard rate is a piecewise flat function of maturity time. Hence we can built the survival probability function using bootstrap method with a linear interpolation based on an approximation formula.
+
+# In[8]:
+
+
+# function to find the index of the time to maturity that came immediately after a time point t
+def locate_maturity(t):
+    # if t is greater than all the maturities, return the length of h by assuming a flat default rate after the longest maturity
+    if t > maturity[-1]:
+        k = len(h)
+    else:
+        # locate the kth satisfying: maturity_k-1 < t <= maturity_k , k = 1,2,...,M
+        k = np.argwhere(maturity[1:] >= t)[0].item() + 1
+        
+    return k
+
+
+# In[9]:
+
+
+# fuction to calibrate the survival probability Q(0,t) as seen from trade date
+def survival_prob(t, h):
+    """
+    :param t: time from trade date to possible default
+    :param h: a series of h [h_1,...,h_M] (eg, h_1 is the instantaneous forward default rate from time 0 to T_1)
+    :return: survival probabilities Q(0,t) (spot rate, not a curve)
+    """
+    # find the index of h_i corresponding to the current t
+    k = locate_maturity(t)
+    # return survival probability according to equation(2) in the assignment requirement
+    return np.exp(-(sum(maturity_diff[:k - 1] * h[:k - 1]) + (t - maturity[k - 1]) * h[k - 1]))
+
+
+# ### 2.2 Protection leg value
+# The protection leg is the contingent payment of (1 – R) on the face value of the protection made following the credit event. In pricing the protection leg, it is important to take into account the timing of the credit event because this can have a significant effect on the present value of the protection leg, especially for longer maturity CDSs. Within the hazard rate approach we can solve this timing problem by conditioning on each small time interval [s,s+ds] between time s0 and time Ti at which the credit event can occur. In our project, the partitions are artificially regulated of K equally-weighted intervals.
+
+# In[10]:
+
+
+# note that the variables no_of_partitions, integration_discount and integration_partition are created because they can be reused in following calculations
+# initialize variable to store the number of integration partitions for each standard CDS
+no_of_partitions = list()
+
+# initialize variable to store discount factors used in integration for each of the standard CDS
+# store them as arrays in lists of length 10
+integration_discount = list()
+
+# initialize variable to store the cut points used in integration for each of the standard CDS
+# store them as arrays in lists of length 10
+integration_partition = list()
+
+for i in range(0, len(TTM)):
+    # break the interval [0,T] into K monthly sub-intervals and store them
+    K = math.ceil(maturity[i+1] * 12)
+    no_of_partitions.append(K)
+    
+    # decide the length of each partition for each std CDS
+    epsilon = maturity[i+1] / K
+    k = np.arange(0, (K + 1))
+    
+    # generate the sub-intervals for each std CDS and store them
+    s_k = epsilon * k
+    integration_partition.append(s_k)
+    
+    # compute discount factors Z(0,s_k) corresponding to the partitions and store them
+    discount_factors = np.asarray([discount_factor(param, x) for x in s_k])
+    integration_discount.append(discount_factors)
+
+
+# In[11]:
+
+
+def protection_leg_value (maturity, param, h, recovery, m=0):
+    """
+    :param maturity: a scalar, maturity of the specific CDS
+    :param param: 4 parameters of Nelson-Siegel model to compute interest rate
+    :param h: a series of deterministic values h [h_1,...,h_M] used in calculating survival probability. h is computed by Newtom-Raphson algorithm
+    :param recovery: recovery rate of the CDS
+    :param m: the m-th standard CDS, where m = 1...10 if the underlying CDS is a standard CDS.
+            0 (or no value provided) indicates non-std CDS.
+            This parameter is used to avoid duplicate calculations when integrating the protection_leg value of the standard CDS
+    :return: protection value of a standard CDS
+    """
+    if m==0: # if the CDS is not standard, calculate how many intervals we need for the integration
+        K = math.ceil(maturity * 12)
+        # calculate the length of each interval
+        epsilon = maturity/K
+        k = np.arange(0, (K+1))
+        # generate partitions
+        s_k = epsilon * k
+        # compute discount factors Z(0,s_k)
+        discount_factors = np.asarray([discount_factor(param, x) for x in s_k])
+
+    else: # if the CDS is standard, take the reusable values from pre-computed lists
+        discount_factors = integration_discount[m-1]
+        s_k = integration_partition[m-1]
+        K = no_of_partitions[m-1]
+
+    # initialization
+    protection_leg = 0
+
+    # compute the summation term in the formula from k = 1 to k = K
+    for i in range(1, K+1):
+        protection_leg = protection_leg + (discount_factors[i-1] + discount_factors[i]) *                          (survival_prob(s_k[i-1], h) - survival_prob(s_k[i], h))
+    
+    # compute protection leg
+    protection_leg = 0.5 * (1 - recovery) * protection_leg
+
+    return protection_leg
+
+
+# ### 2.3 Premium leg value
+# Unlike protection leg, the premium leg is the series of payments of the default swap spread made to maturity or to the time of the credit event, whichever occurs first. It also includes the payment of premium accrued from the previous premium payment date until the time of the credit event. 
+
+# In[12]:
+
+
+def premium_leg_value(spread, N, time_to_pmt, interval_mult_Z, h):
+    """
+    :param spread: a scalar, spread of the specific CDS
+    :param N: a scalar, the total number of times the CDS buyer pays premium
+    :param time_to_pmt: an array of time to premium payment times t0 < t1 < t2 < ... < tn = T
+    :param interval_mult_Z: an array storing result of interval length * discount factor (to avoid redundant calculations)
+    :param h: a series of deterministic values h [h_1,...,h_M] used in calculating survival probability. h is computed by Newtom-Raphson algorithm
+    :param m: the m-th standard CDS, where m = 1...10 if the underlying CDS is a standard CDS.
+            0 (or no value provided) indicates non-std CDS.
+            This parameter is used to avoid duplicate calculations when integrating the protection_leg value of the standard CDS
+    :return: premium leg value of a standard CDS
+    """
+    # initialization
+    premium_leg = 0
+
+    # compute the summation term in the formula
+    for i in range(1, N+1):
+        premium_leg = premium_leg + interval_mult_Z[i-1] *                   (survival_prob(time_to_pmt[i-1], h) + survival_prob(time_to_pmt[i], h))
+    
+    # compute premium leg value
+    premium_leg = spread * 0.5 * premium_leg
+
+    return premium_leg
+
+
+# ### 2.4 Mark-to-market value of CDS
+# We apply the pricing fomula here: CDS value = protection leg value - premium leg value
+
+# In[13]:
+
+
+# function to get the mark-to-market value of a standard CDS value
+def value(maturity, spread, param, N, time_to_pmt, interval_mult_Z, h, recovery, m=0):
+
+    """
+    :param maturity: a scalar, maturity of the specific CDS
+    :param spread: a scalar, spread of the specific CDS
+    :param param: 4 parameters of Nelson-Siegel model to compute interest rate
+    :param N: a scalar, the total number of times the CDS buyer pays premium
+    :param time_to_pmt: an array of time to premium payment times t0 < t1 < t2 < ... < tn = T
+    :param interval_mult_Z: an array storing result of interval length * discount factor (to avoid redundant calculations)
+    :param h: a series of deterministic values h [h_1,...,h_M] used in calculating survival probability. h is computed by Newtom-Raphson algorithm
+    :param recovery: recovery rate of the CDS
+    :param m: the m-th standard CDS, where m = 1...10 if the underlying CDS is a standard CDS.
+            0 (or no value provided) indicates non-std CDS.
+            This parameter is used to avoid duplicate calculations when integrating the protection_leg value of the standard CDS
+    :return: mark-to-market value of a standard CDS
+    """
+    # get protection leg value
+    protection = protection_leg_value(maturity, param, h, recovery, m)
+
+    # get premium leg value
+    premium = premium_leg_value(spread, N, time_to_pmt, interval_mult_Z, h)
+
+    #get CDS value
+    CDS_value = protection - premium
+    
+    return CDS_value
+
+
+# ### 2.5 Newton-Raphson method
+# To solve the algebraic equation with unkonwn varables h(i), we choose to use Newton-Raphson method.
+
+# In[14]:
+
+
+# function to derivate of value function of h_m ,V(h_m), which will be used in following Newton-Raphson method to compute h_m
+def derivative(maturity, spread, param, time_to_pmt, interval_mult_Z, h, recovery, m):
+    """
+    :param maturity: a list of length M, maturity dates for CDS
+    :param spread: a scalar, spread of the specific CDS
+    :param param: 4 parameters of Nelson-Siegel model to compute interest rate
+    :param time_to_pmt: an array of time to premium payment times t0 < t1 < t2 < ... < tn = T
+    :param interval_mult_Z: an array storing result of interval length * discount factor (to avoid redundant calculations)
+    :param h: a series of deterministic values h [h_1,...,h_M] used in calculating survival probability. h is computed by Newtom-Raphson algorithm
+    :param recovery: recovery rate of the CDS
+    :param m: the m-th standard CDS
+    :return: the derivative value of the m-th CDS
+    """
+
+    # since CDS used to calibrate the curve is standard, take the reusable values from pre-computed lists of discount factors, integration partitions and number of partitions
+    discount_factors = integration_discount[m - 1]
+    s_k = integration_partition[m - 1]
+    K = no_of_partitions[m - 1]
+
+    # initialization for loop summation
+    deri_protection_leg = 0
+
+    # compute derivative of the part within the summation notation of protection leg
+    for i in range(1, K+1):
+        deri_protection_leg = deri_protection_leg + (discount_factors[i-1] + discount_factors[i]) *                               (survival_prob(s_k[i-1], h) * min(0, maturity[m-1] - s_k[i-1])                                - survival_prob(s_k[i], h) * min(0, maturity[m-1] - s_k[i]))
+
+    # compute the derivative of protection leg
+    deri_protection_leg = 0.5 * (1 - recovery) * deri_protection_leg
+
+
+    # initialization for loop summation
+    deri_premium_leg = 0
+
+    # i is between 1 and the total number of payments for that CDS
+    # this is to compute derivative of the summation part in premium leg
+    # note that N = TTM * 2, it is the number of payment times - 1
+    for i in range(1, N[m-1] + 2):
+        deri_premium_leg = deri_premium_leg + interval_mult_Z[i-1] *                            (survival_prob(time_to_pmt[i-1], h) * min(0, maturity[m-1] - time_to_pmt[i-1])                            + survival_prob(time_to_pmt[i], h) * min(0, maturity[m-1] - time_to_pmt[i]))
+
+    # compute the derivative of premium leg
+    deri_premium_leg = spread * 0.5 * deri_premium_leg
+
+    return deri_protection_leg - deri_premium_leg
+
+
+# In[15]:
+
+
+# Newton-Raphson method to solve for array h [h_1,...,h_M]
+def N_R(maturity, param, time_to_pmt, interval_mult_Z, recovery):
+    """
+
+    :param maturity: a list of length M, maturity dates for CDS
+    :param param: 4 parameter of Nelson-Siegel model which used to compute interest rate
+    :param time_to_pmt: an array of time to premium payment times t0 < t1 < t2 < ... < tn = T
+    :param interval_mult_Z: interval length * discount factor (to avoid duplicate calculations)
+    :param recovery: recovery rate of the CDS
+    :return: a series of a caliberated value h [h_1,...,h_M]
+    """
+    h = np.ones(len(TTM)) * 0.01  # initial guess of h_i
+    tolerance = 10**(-6)  # tolerance of error
+
+    # solve for h, one unknown for each maturity
+    for i in range(1, len(maturity)):
+        # obtain value from function for a specific CDS
+        value_i = value(maturity[i], spread[i-1], param, N[i-1] + 1, time_to_pmt, interval_mult_Z, h, recovery, i)
+
+        # update the guess for h iteratively while value does not equal to zero
+        while (math.fabs(value_i) > tolerance):
+
+            # calculate derivative
+            derivative_i = derivative(maturity, spread[i - 1], param, time_to_pmt, interval_mult_Z, h, recovery, i)
+
+            # update h
+            h[i - 1] = h[i - 1] - value_i / derivative_i
+
+            # calculate new value from updated h
+            value_i = value(maturity[i], spread[i - 1], param, N[i - 1] + 1, time_to_pmt, interval_mult_Z, h, recovery, i)
+
+    return h
+
+
+# In[16]:
+
+
+# calculated forward default rates
+h = N_R(maturity, param, time_to_pmt, interval_mult_Z, recovery)
+print(h)
+
+
+# ## 3 Application: a new CDS pricing
+# As we have already derived the survival curve Q(0,t), pricing a new CDS is to apply the approximation formula with parameters known.
+
+# In[17]:
+
+
+# maturity dates (after modified following adjustments)
+maturity_date = modified_following(dt.datetime(2042, 5, 15))
+
+valuation_date = dt.datetime(2014, 2, 28)
+
+# previous payment date
+last_pmt_date = modified_following(dt.datetime(2014, 2, 15))
+
+# time elapsed from previous payment date to now, in years, following actual/360 day count convention
+prev_pmt_interval = ((valuation_date - last_pmt_date).days / 360)
+
+# generate future payment dates of the non-std CDS. note that the first element is t_0
+pmt_dates_new = pd.date_range(start='2014-4', end='2042-6', freq='3M', closed='right') + 15*pd.offsets.DateOffset()
+
+# payment dates of the non-std CDS after modified following adjustment
+pmt_dates_new = [modified_following(x) for x in pmt_dates_new]
+
+# calculate the interval between 2 adjacent dates, represented in days, starting from period t to t_0
+interval_new = np.diff([valuation_date] + pmt_dates_new)
+
+# convert the interval length to years
+interval_new = [x.days/360 for x in interval_new]
+
+# calculate time to future payments. the first element is time from current t to t_0
+time_to_pmt_new = np.cumsum(interval_new)
+
+# new time to maturity
+maturity_new = time_to_pmt_new[-1]
+
+# total number of payments (if no default till maturity)
+N_new = len(pmt_dates_new)
+
+# spread, recovery rate and face value with unit of million dollars
+spread_new = 170/10000
+recovery_new = 0.6
+P0=100
+
+# new discount factors for each payment time, starting from t1
+Z_new = np.asarray([discount_factor(param, x) for x in time_to_pmt_new[1:]])
+
+# new interval length * discount factor,
+# note that the first element relates to the period between t to t0, and will not be used in calculation
+interval_mult_Z_new = np.multiply(interval_new[1:], Z_new)
+
+
+# In[18]:
+
+
+# function to calculate the value of a non-standard CDS
+def non_standard_value(maturity, spread, param, N, time_to_pmt, interval_mult_Z, h, recovery, prev_pmt_interval):
+    """
+    :param maturity: a scalar, maturity of the specific CDS
+    :param spread: a scalar, spread of the specific CDS
+    :param param: 4 parameters of Nelson-Siegel model to compute interest rate
+    :param N: a scalar, the total number of times the CDS buyer pays premium assuming no default
+    :param time_to_pmt: an array of time to premium payment times t0 < t1 < t2 < ... < tn = T
+    :param interval_mult_Z: an array storing result of interval length * discount factor
+    :param h: a series of deterministic values h [h_1,...,h_M] used in calculating survival probability. h is computed by Newtom-Raphson algorithm
+    :param recovery: recovery rate of the CDS
+    :param prev_pmt_interval: time elapsed from last payment time, t_-1 to t
+
+    :return: protection leg and premium leg values of non-std CDS
+    """
+    # time to next payment, from t to t0. calculate the corresponding discount factor and survival probability
+    t0 = time_to_pmt[0]
+    z0 = discount_factor(param, t0)
+    q0 = survival_prob(t0, h)
+
+    # get the protection leg value
+    protection = protection_leg_value(maturity, param, h, recovery)
+
+    # calculate the last term in RPV01: the value of future premium payments on payment dates from t_1 onwards
+    # this is done in a way similar to std CDS
+    premium_std = premium_leg_value(spread, N - 1, time_to_pmt, interval_mult_Z, h)
+
+    # adjustments for premium payments on t_0
+    premium_non_std = premium_std + spread * (prev_pmt_interval * z0 * (1 - q0) + 0.5 * t0 * z0 * (1 - q0)                          + (prev_pmt_interval + t0) * z0 * q0)
+
+    return protection, premium_non_std
+
+
+# In[19]:
+
+
+# calculate the value of CDS from protection and premium leg values
+non_std_protection, non_std_premium =non_standard_value(maturity_new, spread_new, param, N_new, time_to_pmt_new,
+                                                         interval_mult_Z_new, h, recovery_new, prev_pmt_interval)
+
+non_std_value = non_std_protection - non_std_premium 
+print(non_std_protection*P0)
+print(non_std_premium*P0)
+print(non_std_value*P0)
+
+
+# In[20]:
+
+
+# calculate the clean value of the CDS using the equation: clean MTM = full MTM - accrued interest
+# for protection buyer, AI = -(t_-1,t) * S0
+AI_buyer = - prev_pmt_interval * spread_new
+non_std_clean_value_buyer = non_std_value - AI_buyer
+print(AI_buyer*P0)
+print(non_std_clean_value_buyer*P0)
+
+
+# ## 4 Summary of results
+# the value of the protection leg is 16.684M dollars
+# 
+# the value of the premium leg is 23.893M dollars
+# 
+# the CDS full MTM value is -7.208M dollars
+# 
+# the CDS clean MTM value is -7.156M dollars
+# 
+# the accrued interest for the protection buyer is -0.052M dollars
+
+# ### 4.1 Figures
+
+# In[21]:
+
+
+# plot term structure of interest rates
+figure = plt.figure()
+
+# create x axis values, from 0 to 31
+x = np.linspace(0, math.ceil(time_to_pmt[-1]))
+
+# create y axis values, computing the values according to Nelson Siegel model
+term_struct_y = np.array([Nelson_Siegel(param, s) for s in x])
+
+# add the first plot in a 1x2 grid
+term_structure = figure.add_subplot(1,2,1)
+term_structure.plot(x, term_struct_y)
+
+# plot the discount factors
+# compute the values of discount factors
+disc_factor_y = np.array([discount_factor(param, s) for s in x])
+
+# add the second plot in a 1x2 grid
+disc_factor = figure.add_subplot(1,2,2)
+disc_factor.plot(x, disc_factor_y)
+
+
+# term structure of interest rates vs. term structure of discount factors
+
+# In[22]:
+
+
+# plot forward default rates
+figure = plt.figure()
+
+# find the value of h corresponding to a time point t
+def find_h(t):
+    # if t is greater than the longest maturity, h is equal to the last entry
+    # (assume default rate is flat after the last maturity)
+    result = h[locate_maturity(t)-1]
+    return result
+
+# calculate y-axis values (h) corresponding to the x-axis
+h_y = np.array([find_h(t) for t in x])
+h_plot = figure.add_subplot(1,2,1)
+h_plot.step(x, h_y)
+
+# plot the survival probability curve
+Q_y = np.array([survival_prob(t, h) for t in x])
+survival_plot = figure.add_subplot(1,2,2)
+survival_plot.plot(x, Q_y)
+plt.show()
+
+
+# forward default rates vs. survival probability curve
+
+# In[23]:
+
+
+# plot r(t), X(0,t) and Q(t) in one table
+table = plt.figure(figsize=(6,10))
+
+# generate three corresponding arrays, namelya col_r, col_Z, and col_Q and reshape them
+col_r = np.array([Nelson_Siegel(param,t) for t in range(0,31)])
+col_Z = np.array([discount_factor(param,t) for t in range(0,31)])
+col_h = h
+col_Q = np.array([survival_prob(t,h) for t in range(0,31)])
+col = np.zeros((31,4))
+col[:,0] = col_r
+col[:,1] = col_Z
+col[:10,2] = col_h
+col[:,3] = col_Q
+
+col_labels = ['interest rate r(t)','discount factor Z(0,t)','h(i)','survival probability Q(0,t)']
+row_labels = np.array([t for t in range(0,31)])
+table = plt.table(cellText=col, colWidths=[0.25]*4, rowLabels=row_labels,                   colLabels=col_labels,loc='best',colLoc='center',rowLoc='center',cellLoc='center')
+plt.axis('off')
+plt.show()
+
+
+# ### 4.2 Conclusion
+# In the Nelson-Siegel yield model, for long maturities, spot and forward rates approach asymptotically the value β0=0.0408, which can be seen from the table. (β0 + β1) determines the starting value of the curve at maturity zero, r0=0.0012; β1=-0.0396 thus represents the deviation from the asymptote β0. The remaining two parameters β2 and τ are responsible for the “hump”. The hump’s magnitude is given by the absolute size of β2 while its direction is given by the sign: a negative sign indicates a U-shape (which is the case in our project) and a positive sign a hump. As τ=1.614, which again must be positive, determines the position of the hump.
+# 
+# The mark-to-market value of new CDS is negative as the position is long protection at 170 bp while the market premium spread to 30Y is now 5.87 bp narrower at 164.13 bp. Since CDS contracts are supposed to have zero value at initiation, this suggests that the credit entity has become less risky over the time and has seen a decrease in the CDS value. For a protection buyer, the accrued interest equals -$0.052M, corresponding to 15 days of accrued interest since the previous coupon payment date which falls on 15 February 2014.
+# 
+# By analyzing the observed market data of the ten CDSs, we derive a positive h(i) piecewise curve along with a monotonically decreasing survival probability curve with horizon time. Positive signs of all forward default rate h(i) guaranteed an arbitrage-free market in this project. Specifically, it is sometimes found that an inverted spread curve could imply negative hazard rates at some point in time. However, if we believe our model specification and recovery rate assumption, then the negative probability would be an indication of arbitrage opportunities, which can be either model dependent or model independent.
+# 
+# Furthermore, a practical explanation could be provided regarding market expectation on credit status. From the Q(h) function, we can easily find that the greater the h(i) is, the quicker the survival probability declines in specific interval. The analogous ‘concave’ shape of the survival probability in our project reflects that the speed of survival probability dropping in the long-term increases, which suggests greater risks and uncertainties as maturity increases. This accords with the nature of a normal credit. On the other hand, if the survival curve goes down quickly at first and slows down later, it may suggest that the market is sceptical about the company’s ability to repay its debt, at least in the short term. But the market may also expect such a company to perform better once it has lived through the difficulties.
+# 
+# At last, we want to go a step further to see the effect of assuming a piecewise linear hazard rate curve instead of a piecewise flat one. We find that this only makes a difference if (i) we do not have quoted spreads for many maturities and (ii) the curve is steeply sloped. This is generally not the case here in this project because most names only have liquidity at the 5-year CDS and the curve is therefore assumed to be flat. The main exception is when we have an inverted spread curve, usually associated with a distressed credit. In this project we have enough market spreads, especially at short maturities from 6M to 5Y. As a result, we will keep the model simple by assuming a piecewise flat structure as required, although we note that the generalization to a linear scheme is actually fairly straightforward.
+# 
+
+# ## Appendix
+# The following code is to output a csv file for all calculated results.
+
+# In[24]:
+
+
+"""
+import os
+os.chdir(r'C:\temp')# please modify the working path
+outfile = open("FE8709 Credit Risk Assignment1 answer .csv", "w", newline="")
+
+# ouput a table for the value of interest rate r(t), discount factor Z(0,t), h_i, and survival probability Q(0,t)
+# for t = 1,2,3,...,T , T = 30
+table1 = pd.DataFrame(zip(np.array([t for t in range(1,31)]), np.array([Nelson_Siegel(param,t) for t in range(1,31)]), \
+                         np.array([discount_factor(param,t) for t in range(1,31)])), \
+                     columns=['time(years)','interest rate','discount factor'])
+table1.to_csv(outfile, index=0)
+
+outfile.write("\n")
+table2 = pd.DataFrame(zip(np.array([m for m in range(1,11)]),h),columns=['M','h'])
+table2.to_csv(outfile,index=0)
+
+outfile.write("\n")
+table3 = pd.DataFrame(zip(np.array([t for t in range(0,31)]),np.array([survival_prob(t,h) for t in range(0,31)])),\
+                      columns=['maturity','survival probability'])
+table3.to_csv(outfile,index=0)
+
+
+# output the value of the protection leg
+outfile.write("\nthe value of protection leg\n")
+outfile.write(str(non_std_protection))
+
+# output the value of the premium leg
+outfile.write("\nthe value of premium leg\n")
+outfile.write(str(non_std_premium))
+
+# output the full value of the CDS
+outfile.write("\nthe full value of the CDS\n")
+outfile.write(str(non_std_value))
+
+# output the clean value of the CDS and the accrued interest for the protection buyer
+outfile.write("\nthe clean value of the CDS for protection seller\n")
+outfile.write(str(non_std_clean_value_seller))
+
+outfile.write("\nthe clean value of the CDS for protection buyer\n")
+outfile.write(str(non_std_clean_value_buyer))
+
+outfile.write("\nthe accrued interest for the protection buyer\n")
+outfile.write(str(AI_buyer))
+
+outfile.close()
+"""
